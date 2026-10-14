@@ -1,0 +1,24 @@
+# Python virtual environments
+venv/
+env/
+chatterbox-env/
+chatterbox-env-old/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment variables and secrets
+.env
+.env.*
+
+# Keep example environment configuration
+!.env.example
+
+# Logs
+*.log
+
+# IDE files
+.vscode/
+.idea/

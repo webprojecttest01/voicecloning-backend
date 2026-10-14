@@ -1,0 +1,5 @@
+Flask
+Flask-Cors
+requests
+python-dotenv
+fish-audio-sdk

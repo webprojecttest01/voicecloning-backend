@@ -1,0 +1,19 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "Unified Voice AI Backend",
+  "main": "app.py",
+  "scripts": {
+    "start": "chatterbox-env\\Scripts\\python app.py",
+    "dev": "chatterbox-env\\Scripts\\python app.py"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.4",
+    "express": "^5.2.1",
+    "multer": "^2.4.0"
+  }
+}
