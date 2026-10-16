@@ -213,6 +213,10 @@ SUPPORTED_LANGUAGES = {
 # FASTAPI APP CREATION & MIDDLEWARE
 # ============================================================
 
+# ============================================================
+# FASTAPI APP CREATION & MIDDLEWARE
+# ============================================================
+
 app = FastAPI(
     title="Unified Voice AI Backend API",
     version="1.0.0"
@@ -221,35 +225,27 @@ app = FastAPI(
 app.add_middleware(
     SessionMiddleware,
     secret_key=FLASK_SECRET_KEY,
-    same_site=os.getenv(
-        "SESSION_COOKIE_SAMESITE",
-        "none" if IS_PRODUCTION else "lax"
-    ).lower(),
-    https_only=os.getenv(
-        "SESSION_COOKIE_SECURE",
-        "true" if IS_PRODUCTION else "false"
-    ).lower() == "true"
+    same_site="none",
+    https_only=True
 )
 
-default_cors_origins = [
+cors_origins = [
+    "https://voicecloning-frontend-zeta.vercel.app",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5174",
-    "http://localhost:5175",
-    "http://127.0.0.1:5175",
     "http://localhost:5176",
     "http://127.0.0.1:5176",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
-cors_origins = [
+
+extra_origins = [
     origin.strip()
     for origin in os.getenv("CORS_ORIGINS", "").split(",")
     if origin.strip()
 ]
-if not IS_PRODUCTION:
-    cors_origins = list(dict.fromkeys(default_cors_origins + cors_origins))
+
+cors_origins = list(dict.fromkeys(cors_origins + extra_origins))
 
 app.add_middleware(
     CORSMiddleware,
@@ -259,7 +255,6 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
-
 
 # ============================================================
 # HEALTH CHECK
