@@ -1,5 +1,9 @@
-Flask
-Flask-Cors
-requests
+argostranslate
+chatterbox-tts
+fastapi
+faster-whisper
 python-dotenv
-fish-audio-sdk
+python-multipart
+requests
+uvicorn[standard]
+werkzeug

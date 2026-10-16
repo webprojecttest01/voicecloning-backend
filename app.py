@@ -1,5 +1,6 @@
 import sys
 import os
+import secrets
 
 # Auto-detect chatterbox venv python if running with standard system python missing dependencies
 _venv_python = os.path.join(os.path.dirname(__file__), "chatterbox-env", "Scripts", "python.exe")
@@ -29,10 +30,15 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 load_dotenv()
 
-FLASK_SECRET_KEY = os.getenv(
-    "FLASK_SECRET_KEY",
-    "dev-secret-key"
+IS_PRODUCTION = (
+    os.getenv("ENVIRONMENT", "").lower() == "production"
+    or bool(os.getenv("RAILWAY_ENVIRONMENT"))
 )
+FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY") or os.getenv("SECRET_KEY")
+if IS_PRODUCTION and not FLASK_SECRET_KEY:
+    raise RuntimeError("FLASK_SECRET_KEY must be configured in production")
+if not FLASK_SECRET_KEY:
+    FLASK_SECRET_KEY = secrets.token_urlsafe(32)
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
@@ -41,11 +47,12 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 # FOLDERS SETUP
 # ============================================================
 
-OUTPUT_DIR = "generated_audio"
-VOICE_DIR = "voice_samples"
-UPLOAD_DIR = "dubbing_uploads"
-DUBBING_OUTPUT_DIR = "dubbing_output"
-DUBBING_VOICE_DIR = "dubbing_voices"
+DATA_DIR = os.path.abspath(os.getenv("DATA_DIR", os.path.dirname(__file__)))
+OUTPUT_DIR = os.path.join(DATA_DIR, "generated_audio")
+VOICE_DIR = os.path.join(DATA_DIR, "voice_samples")
+UPLOAD_DIR = os.path.join(DATA_DIR, "dubbing_uploads")
+DUBBING_OUTPUT_DIR = os.path.join(DATA_DIR, "dubbing_output")
+DUBBING_VOICE_DIR = os.path.join(DATA_DIR, "dubbing_voices")
 
 for folder in [OUTPUT_DIR, VOICE_DIR, UPLOAD_DIR, DUBBING_OUTPUT_DIR, DUBBING_VOICE_DIR]:
     os.makedirs(folder, exist_ok=True)
@@ -55,7 +62,7 @@ for folder in [OUTPUT_DIR, VOICE_DIR, UPLOAD_DIR, DUBBING_OUTPUT_DIR, DUBBING_VO
 # DATABASE SETUP
 # ============================================================
 
-DATABASE = "users.db"
+DATABASE = os.path.join(DATA_DIR, "users.db")
 
 
 def get_db_connection():
@@ -214,20 +221,39 @@ app = FastAPI(
 app.add_middleware(
     SessionMiddleware,
     secret_key=FLASK_SECRET_KEY,
-    same_site="lax",
-    https_only=False
+    same_site=os.getenv(
+        "SESSION_COOKIE_SAMESITE",
+        "none" if IS_PRODUCTION else "lax"
+    ).lower(),
+    https_only=os.getenv(
+        "SESSION_COOKIE_SECURE",
+        "true" if IS_PRODUCTION else "false"
+    ).lower() == "true"
 )
+
+default_cors_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
+    "http://localhost:5176",
+    "http://127.0.0.1:5176",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if not IS_PRODUCTION:
+    cors_origins = list(dict.fromkeys(default_cors_origins + cors_origins))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5176",
-        "http://127.0.0.1:5176",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000"
-    ],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
