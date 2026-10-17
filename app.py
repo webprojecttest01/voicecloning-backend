@@ -1,6 +1,7 @@
 import sys
 import os
 import secrets
+from contextlib import asynccontextmanager
 
 # Auto-detect chatterbox venv python if running with standard system python missing dependencies
 _venv_python = os.path.join(os.path.dirname(__file__), "chatterbox-env", "Scripts", "python.exe")
@@ -62,73 +63,174 @@ for folder in [OUTPUT_DIR, VOICE_DIR, UPLOAD_DIR, DUBBING_OUTPUT_DIR, DUBBING_VO
 # DATABASE SETUP
 # ============================================================
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+if IS_PRODUCTION and not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL must be configured in production. Attach a Railway PostgreSQL database."
+    )
 DATABASE = os.path.join(DATA_DIR, "users.db")
 
 
 def get_db_connection():
+    if DATABASE_URL:
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as error:
+            raise RuntimeError(
+                "psycopg is required when DATABASE_URL is configured"
+            ) from error
+
+        database_url = DATABASE_URL
+        if database_url.startswith("postgres://"):
+            database_url = "postgresql://" + database_url[len("postgres://"):]
+        return psycopg.connect(
+            database_url,
+            connect_timeout=10,
+            row_factory=dict_row
+        )
+
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def execute_sql(conn, query, parameters=()):
+    if DATABASE_URL:
+        query = query.replace("?", "%s")
+    return conn.execute(query, parameters)
+
+
 def init_database():
     conn = get_db_connection()
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL
-        )
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            text_snippet TEXT NOT NULL,
-            char_count INTEGER NOT NULL,
-            token_count INTEGER NOT NULL,
-            model_used TEXT NOT NULL,
-            cost_usd REAL NOT NULL,
-            cost_inr REAL NOT NULL,
-            status TEXT DEFAULT 'COMPLETED',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_balances (
-            user_id INTEGER PRIMARY KEY,
-            balance_tokens INTEGER DEFAULT 5553333,
-            balance_usd REAL DEFAULT 49.98,
-            balance_inr REAL DEFAULT 4173.24
-        )
-        """
-    )
-
     try:
-        cols = [c[1] for c in conn.execute("PRAGMA table_info(user_balances)").fetchall()]
-        if "balance_tokens" not in cols:
-            conn.execute("ALTER TABLE user_balances ADD COLUMN balance_tokens INTEGER DEFAULT 5553333")
-            conn.execute("UPDATE user_balances SET balance_tokens = CAST(ROUND((balance_usd / 0.000009)) AS INTEGER)")
-            conn.commit()
-    except Exception as e:
-        print("Database balance_tokens migration notice:", e)
+        if DATABASE_URL:
+            id_type = "BIGSERIAL PRIMARY KEY"
+            user_id_type = "BIGINT"
+            money_type = "DOUBLE PRECISION"
+        else:
+            id_type = "INTEGER PRIMARY KEY AUTOINCREMENT"
+            user_id_type = "INTEGER"
+            money_type = "REAL"
 
-    conn.commit()
-    conn.close()
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS users (
+                id {id_type},
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL
+            )
+            """
+        )
 
-    print("Database initialized successfully with token balance support")
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id {id_type},
+                user_id {user_id_type},
+                text_snippet TEXT NOT NULL,
+                char_count INTEGER NOT NULL,
+                token_count INTEGER NOT NULL,
+                model_used TEXT NOT NULL,
+                cost_usd {money_type} NOT NULL,
+                cost_inr {money_type} NOT NULL,
+                status TEXT DEFAULT 'COMPLETED',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
 
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS user_balances (
+                user_id {user_id_type} PRIMARY KEY,
+                balance_tokens BIGINT DEFAULT 5553333,
+                balance_usd {money_type} DEFAULT 49.98,
+                balance_inr {money_type} DEFAULT 4173.24
+            )
+            """
+        )
 
-init_database()
+        if DATABASE_URL:
+            columns = {
+                row["column_name"]
+                for row in execute_sql(
+                    conn,
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'user_balances'
+                    """
+                ).fetchall()
+            }
+        else:
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(user_balances)").fetchall()
+            }
+
+        if "balance_tokens" not in columns:
+            conn.execute(
+                "ALTER TABLE user_balances ADD COLUMN balance_tokens BIGINT DEFAULT 5553333"
+            )
+            conn.execute(
+                "UPDATE user_balances SET balance_tokens = "
+                "CAST(ROUND((balance_usd / 0.000009)) AS BIGINT)"
+            )
+
+        default_email = os.getenv("DEFAULT_USER_EMAIL", "").strip().lower()
+        default_password = os.getenv("DEFAULT_USER_PASSWORD", "")
+        default_name = os.getenv("DEFAULT_USER_NAME", "Voice AI User").strip()
+        if bool(default_email) != bool(default_password):
+            raise RuntimeError(
+                "Set both DEFAULT_USER_EMAIL and DEFAULT_USER_PASSWORD to seed a default account"
+            )
+
+        if default_email:
+            if len(default_password) < 12:
+                raise RuntimeError(
+                    "DEFAULT_USER_PASSWORD must be at least 12 characters"
+                )
+            execute_sql(
+                conn,
+                """
+                INSERT INTO users (name, email, password)
+                VALUES (?, ?, ?)
+                ON CONFLICT(email) DO NOTHING
+                """,
+                (
+                    default_name or "Voice AI User",
+                    default_email,
+                    generate_password_hash(default_password)
+                )
+            )
+            user = execute_sql(
+                conn,
+                "SELECT id FROM users WHERE email = ?",
+                (default_email,)
+            ).fetchone()
+            execute_sql(
+                conn,
+                """
+                INSERT INTO user_balances (user_id, balance_tokens, balance_usd, balance_inr)
+                VALUES (?, 5553333, 49.98, 4173.24)
+                ON CONFLICT(user_id) DO NOTHING
+                """,
+                (user["id"],)
+            )
+
+        conn.commit()
+        print(
+            "Database initialized successfully "
+            f"({'PostgreSQL' if DATABASE_URL else 'SQLite'})"
+        )
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 # ============================================================
@@ -213,20 +315,38 @@ SUPPORTED_LANGUAGES = {
 # FASTAPI APP CREATION & MIDDLEWARE
 # ============================================================
 
-# ============================================================
-# FASTAPI APP CREATION & MIDDLEWARE
-# ============================================================
+SESSION_COOKIE_SAMESITE = os.getenv(
+    "SESSION_COOKIE_SAMESITE",
+    "none" if IS_PRODUCTION else "lax"
+).lower()
+SESSION_COOKIE_SECURE = os.getenv(
+    "SESSION_COOKIE_SECURE",
+    str(IS_PRODUCTION).lower()
+).lower() == "true"
+
+if SESSION_COOKIE_SAMESITE not in {"lax", "strict", "none"}:
+    raise RuntimeError("SESSION_COOKIE_SAMESITE must be lax, strict or none")
+if SESSION_COOKIE_SAMESITE == "none" and not SESSION_COOKIE_SECURE:
+    raise RuntimeError("SESSION_COOKIE_SECURE must be true when SameSite is none")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_database()
+    yield
+
 
 app = FastAPI(
     title="Unified Voice AI Backend API",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 app.add_middleware(
     SessionMiddleware,
     secret_key=FLASK_SECRET_KEY,
-    same_site="none",
-    https_only=True
+    same_site=SESSION_COOKIE_SAMESITE,
+    https_only=SESSION_COOKIE_SECURE
 )
 
 cors_origins = [
@@ -263,9 +383,16 @@ app.add_middleware(
 @app.get("/")
 @app.get("/health")
 def health_check():
+    conn = get_db_connection()
+    try:
+        execute_sql(conn, "SELECT 1")
+    finally:
+        conn.close()
+
     return {
         "status": "ok",
         "message": "Unified Voice AI master backend is running",
+        "database": "connected",
         "supported_languages": SUPPORTED_LANGUAGES
     }
 
@@ -297,7 +424,8 @@ async def signup(request: Request):
 
         conn = get_db_connection()
 
-        existing_user = conn.execute(
+        existing_user = execute_sql(
+            conn,
             "SELECT id FROM users WHERE email = ?",
             (email,)
         ).fetchone()
@@ -308,16 +436,18 @@ async def signup(request: Request):
 
         hashed_password = generate_password_hash(password)
 
-        cursor = conn.execute(
+        cursor = execute_sql(
+            conn,
             """
             INSERT INTO users (name, email, password)
             VALUES (?, ?, ?)
+            RETURNING id
             """,
             (name, email, hashed_password)
         )
 
+        user_id = cursor.fetchone()["id"]
         conn.commit()
-        user_id = cursor.lastrowid
         conn.close()
 
         request.session["user_id"] = user_id
@@ -357,7 +487,8 @@ async def login(request: Request):
 
         conn = get_db_connection()
 
-        user = conn.execute(
+        user = execute_sql(
+            conn,
             """
             SELECT id, name, email, password
             FROM users
@@ -662,12 +793,17 @@ def calculate_token_cost(text: str, model_key: str = "eleven_multilingual_v2"):
 
 def get_user_balance_and_ensure(user_id: int):
     conn = get_db_connection()
-    row = conn.execute("SELECT balance_tokens, balance_usd, balance_inr FROM user_balances WHERE user_id = ?", (user_id,)).fetchone()
+    row = execute_sql(
+        conn,
+        "SELECT balance_tokens, balance_usd, balance_inr FROM user_balances WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
     if not row:
         default_tokens = 5553333
         default_usd = 49.98
         default_inr = 4173.24
-        conn.execute(
+        execute_sql(
+            conn,
             "INSERT INTO user_balances (user_id, balance_tokens, balance_usd, balance_inr) VALUES (?, ?, ?, ?)",
             (user_id, default_tokens, default_usd, default_inr)
         )
@@ -681,7 +817,11 @@ def get_user_balance_and_ensure(user_id: int):
         balance_inr = row["balance_inr"]
         if balance_tokens is None:
             balance_tokens = int(round((balance_usd or 0) / USD_PER_TOKEN))
-            conn.execute("UPDATE user_balances SET balance_tokens = ? WHERE user_id = ?", (balance_tokens, user_id))
+            execute_sql(
+                conn,
+                "UPDATE user_balances SET balance_tokens = ? WHERE user_id = ?",
+                (balance_tokens, user_id)
+            )
             conn.commit()
     conn.close()
     return int(balance_tokens), float(balance_usd), float(balance_inr)
@@ -709,20 +849,23 @@ def record_transaction_in_db(user_id: int, text_snippet: str, char_count: int, t
     new_usd = round(new_tokens * USD_PER_TOKEN, 2)
     new_inr = round(new_usd * INR_PER_USD, 2)
 
-    conn.execute(
+    execute_sql(
+        conn,
         "UPDATE user_balances SET balance_tokens = ?, balance_usd = ?, balance_inr = ? WHERE user_id = ?",
         (new_tokens, new_usd, new_inr, user_id)
     )
 
-    cursor = conn.execute(
+    cursor = execute_sql(
+        conn,
         """
         INSERT INTO transactions (user_id, text_snippet, char_count, token_count, model_used, cost_usd, cost_inr, status)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'COMPLETED')
+        RETURNING id
         """,
         (user_id, text_snippet[:120], char_count, token_count, model_used, cost_usd, cost_inr)
     )
+    trans_id = cursor.fetchone()["id"]
     conn.commit()
-    trans_id = cursor.lastrowid
     conn.close()
     return trans_id, new_tokens, new_usd, new_inr
 
@@ -746,7 +889,8 @@ def api_payment_history(request: Request):
         b_tokens, b_usd, b_inr = get_user_balance_and_ensure(user_id)
 
         conn = get_db_connection()
-        rows = conn.execute(
+        rows = execute_sql(
+            conn,
             """
             SELECT id, text_snippet, char_count, token_count, model_used, cost_usd, cost_inr, status, created_at
             FROM transactions
@@ -760,6 +904,10 @@ def api_payment_history(request: Request):
         conn.close()
 
         transactions = [dict(r) for r in rows]
+        for transaction in transactions:
+            created_at = transaction["created_at"]
+            if hasattr(created_at, "isoformat"):
+                transaction["created_at"] = created_at.isoformat()
 
         # Calculate totals
         total_tokens = sum(t["token_count"] for t in transactions if t.get("status") != "TOPUP")
@@ -856,22 +1004,25 @@ async def api_topup_wallet(request: Request):
         new_usd = round(new_tokens * USD_PER_TOKEN, 2)
         new_inr = round(new_usd * INR_PER_USD, 2)
 
-        conn.execute(
+        execute_sql(
+            conn,
             "UPDATE user_balances SET balance_tokens = ?, balance_usd = ?, balance_inr = ? WHERE user_id = ?",
             (new_tokens, new_usd, new_inr, user_id)
         )
 
         # Log as special TOPUP transaction
-        cursor = conn.execute(
+        cursor = execute_sql(
+            conn,
             """
             INSERT INTO transactions (user_id, text_snippet, char_count, token_count, model_used, cost_usd, cost_inr, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'TOPUP')
+            RETURNING id
             """,
             (user_id, f"Wallet Top-Up: +{tokens_to_add:,} Tokens (+${amount_usd:.2f} [INR {amount_inr:.2f}])", 0, tokens_to_add, "wallet_topup", -amount_usd, -amount_inr)
         )
 
+        trans_id = cursor.fetchone()["id"]
         conn.commit()
-        trans_id = cursor.lastrowid
         conn.close()
 
         print("TOPUP: user={} +{} tokens +${} (INR {}) new_balance={} tokens".format(user_id, tokens_to_add, amount_usd, amount_inr, new_tokens))
